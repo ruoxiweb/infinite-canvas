@@ -4,6 +4,7 @@ import { persist } from "zustand/middleware";
 import { nanoid } from "nanoid";
 
 import i18n from "@/i18n";
+import { cloudflareAccessEmail } from "@/lib/cloudflare-access";
 
 export type ApiCallFormat = "openai" | "gemini";
 export type ModelCapability = "image" | "video" | "text" | "audio";
@@ -54,6 +55,8 @@ export type AiConfig = {
     canvasImageCount: string;
     proxyEnabled: boolean;
     proxyUrl: string;
+    /** Set when the user deletes the built-in team channel; stops it from being re-seeded on reload. */
+    teamChannelDismissed: boolean;
 };
 
 export type WebdavSyncConfig = {
@@ -121,6 +124,7 @@ export const defaultConfig: AiConfig = {
     canvasImageCount: "3",
     proxyEnabled: false,
     proxyUrl: DEFAULT_LOCAL_PROXY_URL,
+    teamChannelDismissed: false,
 };
 
 export const defaultWebdavSyncConfig: WebdavSyncConfig = {
@@ -130,6 +134,74 @@ export const defaultWebdavSyncConfig: WebdavSyncConfig = {
     directory: "infinite-canvas",
     lastSyncedAt: "",
 };
+
+// ---- Built-in team channel (Cloudflare Access) ----
+// Deployments behind Cloudflare Access can inject a shared provider channel for signed-in team
+// members. All values come from build-time environment variables; see CLOUDFLARE.md.
+export const TEAM_CHANNEL_ID = "team";
+
+function envValue(value: string | undefined) {
+    return (value || "").trim();
+}
+
+const TEAM_EMAIL_DOMAIN = envValue(import.meta.env.VITE_TEAM_EMAIL_DOMAIN).toLowerCase() || "mithrilhz.com";
+const TEAM_BASE_URL = envValue(import.meta.env.VITE_TEAM_BASE_URL);
+const TEAM_API_KEY = envValue(import.meta.env.VITE_TEAM_API_KEY);
+const TEAM_CHANNEL_NAME = envValue(import.meta.env.VITE_TEAM_CHANNEL_NAME) || i18n.t("config.channels.teamName");
+const TEAM_MODEL_NAMES = envValue(import.meta.env.VITE_TEAM_MODELS)
+    .split(",")
+    .map((name) => name.trim())
+    .filter(Boolean);
+const TEAM_PROVISIONING_ENABLED = Boolean(TEAM_BASE_URL && TEAM_API_KEY);
+
+function teamChannel(): ModelChannel {
+    return {
+        id: TEAM_CHANNEL_ID,
+        name: TEAM_CHANNEL_NAME,
+        baseUrl: TEAM_BASE_URL,
+        apiKey: TEAM_API_KEY,
+        apiFormat: "openai",
+        models: normalizeChannelModels(TEAM_MODEL_NAMES),
+    };
+}
+
+/**
+ * Seed or refresh the built-in team channel when the visitor signed in through Cloudflare Access
+ * with a team email. Endpoint and key always follow the build-time values so a rotation propagates;
+ * users can still curate the channel's models, or delete it to opt out for that browser.
+ */
+export function applyTeamProvisioning(config: AiConfig): AiConfig {
+    if (!TEAM_PROVISIONING_ENABLED) return config;
+    if (!cloudflareAccessEmail().endsWith(`@${TEAM_EMAIL_DOMAIN}`)) return config;
+
+    const desired = teamChannel();
+    const existing = config.channels.find((channel) => channel.id === TEAM_CHANNEL_ID);
+    if (!existing) {
+        if (config.teamChannelDismissed) return config;
+        const channels = [desired, ...config.channels];
+        return withTeamModelDefaults({ ...config, channels, models: modelOptionsFromChannels(channels) }, desired);
+    }
+    const models = existing.models.length ? existing.models : desired.models;
+    if (existing.baseUrl === desired.baseUrl && existing.apiKey === desired.apiKey && models === existing.models) return config;
+    const channels = config.channels.map((channel) => (channel.id === TEAM_CHANNEL_ID ? { ...channel, baseUrl: desired.baseUrl, apiKey: desired.apiKey, models } : channel));
+    return { ...config, channels, models: modelOptionsFromChannels(channels) };
+}
+
+/** First-run convenience: when no keyed channel exists yet, default every capability to the team models. */
+function withTeamModelDefaults(config: AiConfig, team: ModelChannel): AiConfig {
+    if (config.channels.some((channel) => channel.id !== TEAM_CHANNEL_ID && channel.apiKey.trim())) return config;
+    const next = { ...config };
+    const pick = (capability: ModelCapability) => team.models.find((model) => model.capability === capability);
+    const image = pick("image");
+    if (image) next.imageModel = next.model = encodeChannelModel(TEAM_CHANNEL_ID, image.name);
+    const video = pick("video");
+    if (video) next.videoModel = encodeChannelModel(TEAM_CHANNEL_ID, video.name);
+    const text = pick("text");
+    if (text) next.textModel = encodeChannelModel(TEAM_CHANNEL_ID, text.name);
+    const audio = pick("audio");
+    if (audio) next.audioModel = encodeChannelModel(TEAM_CHANNEL_ID, audio.name);
+    return next;
+}
 
 type ConfigStore = {
     config: AiConfig;
@@ -250,7 +322,7 @@ export const useConfigStore = create<ConfigStore>()(
                 return {
                     ...current,
                     webdav: { ...defaultWebdavSyncConfig, ...persistedWebdav },
-                    config: {
+                    config: applyTeamProvisioning({
                         ...config,
                         channelMode: "local",
                         apiFormat: normalizeApiFormat(config.apiFormat),
@@ -273,7 +345,8 @@ export const useConfigStore = create<ConfigStore>()(
                         canvasImageCount: config.canvasImageCount || "3",
                         proxyEnabled: Boolean(config.proxyEnabled),
                         proxyUrl: config.proxyUrl || DEFAULT_LOCAL_PROXY_URL,
-                    },
+                        teamChannelDismissed: Boolean(config.teamChannelDismissed),
+                    }),
                 };
             },
         },
@@ -312,10 +385,7 @@ export function createModelChannel(channel?: Partial<ModelChannel>): ModelChanne
     };
 }
 
-export function upsertChannelCredentials(
-    config: AiConfig,
-    input: { baseUrl?: string | null; apiKey?: string | null },
-): ChannelCredentialsImportResult & { config: AiConfig } {
+export function upsertChannelCredentials(config: AiConfig, input: { baseUrl?: string | null; apiKey?: string | null }): ChannelCredentialsImportResult & { config: AiConfig } {
     const rawBaseUrl = input.baseUrl?.trim() || "";
     if (!rawBaseUrl) return { status: "missing-base-url", config };
     if (!isHttpBaseUrl(rawBaseUrl)) return { status: "invalid-base-url", config };
@@ -421,7 +491,18 @@ export function resolveModelChannel(config: AiConfig, value: string) {
     const decoded = decodeChannelModel(value);
     const model = decoded?.model || value;
     const matched = decoded ? config.channels.find((channel) => channel.id === decoded.channelId) : config.channels.find((channel) => channel.models.some((item) => item.name === model));
-    return matched || config.channels[0] || createModelChannel({ id: "default", name: i18n.t("config.channels.defaultName"), baseUrl: config.baseUrl, apiKey: config.apiKey, apiFormat: config.apiFormat, models: config.models.map(modelOptionName).map((name) => ({ name, capability: guessCapability(name) })) });
+    return (
+        matched ||
+        config.channels[0] ||
+        createModelChannel({
+            id: "default",
+            name: i18n.t("config.channels.defaultName"),
+            baseUrl: config.baseUrl,
+            apiKey: config.apiKey,
+            apiFormat: config.apiFormat,
+            models: config.models.map(modelOptionName).map((name) => ({ name, capability: guessCapability(name) })),
+        })
+    );
 }
 
 export function resolveModelRequestConfig(config: AiConfig, value: string) {

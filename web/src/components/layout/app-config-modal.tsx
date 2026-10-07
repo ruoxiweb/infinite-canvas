@@ -14,7 +14,19 @@ import { exportAppConfig, importAppConfig } from "@/services/config-file";
 import { syncAppDataToWebdav, type AppSyncDomainKey, type AppSyncProgressEvent } from "@/services/app-sync";
 import { testWebdavConnection, WEBDAV_MANIFEST_FILE_NAME } from "@/services/webdav-sync";
 import { audioFormatOptions, audioVoiceOptions, normalizeAudioSpeedValue } from "@/lib/audio-generation";
-import { createModelChannel, modelOptionsFromChannels, normalizeModelOptionValue, selectableModelsByCapability, useConfigStore, type AiConfig, type ApiCallFormat, type ConfigTabKey, type ModelCapability, type ModelChannel } from "@/stores/use-config-store";
+import {
+    createModelChannel,
+    modelOptionsFromChannels,
+    normalizeModelOptionValue,
+    selectableModelsByCapability,
+    TEAM_CHANNEL_ID,
+    useConfigStore,
+    type AiConfig,
+    type ApiCallFormat,
+    type ConfigTabKey,
+    type ModelCapability,
+    type ModelChannel,
+} from "@/stores/use-config-store";
 
 type ModelGroup = {
     capability: ModelCapability;
@@ -106,6 +118,8 @@ export function AppConfigPanel({ showDoneButton = false, initialTab = "channels"
             return;
         }
         updateChannels(config.channels.filter((channel) => channel.id !== id));
+        // Deleting the built-in team channel is an explicit opt-out; remember it so hydration does not re-seed it.
+        if (id === TEAM_CHANNEL_ID) updateConfig("teamChannelDismissed", true);
     };
 
     const saveChannel = (channel: ModelChannel) => {
@@ -195,7 +209,12 @@ export function AppConfigPanel({ showDoneButton = false, initialTab = "channels"
                                     {config.channels.map((channel) => (
                                         <div key={channel.id} className="flex items-center justify-between gap-3 rounded-lg border border-stone-200 px-4 py-3 dark:border-stone-800">
                                             <div className="min-w-0">
-                                                <div className="truncate text-sm font-semibold">{channel.name || t("config.channels.unnamed")}</div>
+                                                <div className="truncate text-sm font-semibold">
+                                                    {channel.name || t("config.channels.unnamed")}
+                                                    {channel.id === TEAM_CHANNEL_ID && (
+                                                        <span className="ml-2 inline-block rounded bg-stone-100 px-1.5 py-0.5 align-middle text-[10px] font-medium text-stone-500 dark:bg-stone-800 dark:text-stone-400">{t("config.channels.builtIn")}</span>
+                                                    )}
+                                                </div>
                                                 <div className="mt-1 truncate text-xs text-stone-500">
                                                     {apiFormatLabel(channel.apiFormat)} · {t("config.channels.modelCount", { count: channel.models.length })} · {channel.baseUrl || t("config.channels.missingUrl")}
                                                 </div>
